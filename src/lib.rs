@@ -1,4 +1,7 @@
+use rayon::prelude::*;
+use std::fmt::Debug;
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::available_parallelism;
 use threadpool::ThreadPool;
@@ -42,7 +45,7 @@ use threadpool::ThreadPool;
 // Adjust the threshold
 const THRESHOLD: usize = 128;
 
-pub fn straightforward_parallel<T, R>(data: &[T], f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
     T: Send + Clone + 'static,
     R: Send + 'static,
@@ -76,7 +79,113 @@ where
     }
 }
 
-pub fn flexible_parallel<T, R>(data: &[T], f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel_arc<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+where
+    T: Send + Clone + Sync + 'static,
+    R: Send + Clone + Default + Debug + 'static,
+{
+    if data.len() == 0 {
+        // Nothing to process
+        vec![]
+    } else if data.len() < THRESHOLD {
+        // Process sequentially if below the threshold
+        data.iter().map(|item| f(item.clone())).collect()
+    } else {
+        let input = Arc::new(data.clone());
+        let output = Arc::new(Mutex::new(vec![R::default(); data.len()]));
+
+        // Split the work into threads
+        let num_workers = available_parallelism().unwrap().get();
+        let chunk_size = (data.len() + num_workers - 1) / num_workers;
+
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for i in 0..num_workers {
+            let input = Arc::clone(&input);
+            let output = Arc::clone(&output);
+            let handle = thread::spawn(move || {
+                let start = i * chunk_size;
+                let end = std::cmp::min(start + chunk_size, input.len());
+
+                for j in start..end {
+                    let result = f(input[j].clone());
+                    output.lock().unwrap()[j] = result;
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        Arc::try_unwrap(output).unwrap().into_inner().unwrap()
+    }
+}
+
+pub fn straightforward_parallel_arc_nomutex<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+where
+    T: Send + Clone + Sync + 'static,
+    R: Send + Clone + Default + Debug + 'static,
+{
+    if data.len() == 0 {
+        // Nothing to process
+        vec![]
+    } else if data.len() < THRESHOLD {
+        // Process sequentially if below the threshold
+        data.iter().map(|item| f(item.clone())).collect()
+    } else {
+        let input = Arc::new(data.clone());
+
+        // Split the work into threads
+        let num_workers = available_parallelism().unwrap().get();
+        let chunk_size = (data.len() + num_workers - 1) / num_workers;
+
+        let mut handles = Vec::with_capacity(num_workers);
+        let mut results = Vec::with_capacity(data.len());
+
+        for i in 0..num_workers {
+            let input = Arc::clone(&input);
+            let handle = thread::spawn(move || {
+                let start = i * chunk_size;
+                let end = std::cmp::min(start + chunk_size, input.len());
+
+                let chunk = &input[start..end];
+                chunk.iter().map(|item| f(item.clone())).collect::<Vec<_>>()
+
+                //let chunk_data = chunk.to_vec();
+                //chunk_data.into_iter().map(f).collect::<Vec<_>>()
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from threads
+        for handle in handles {
+            results.extend(handle.join().unwrap());
+        }
+
+        results
+    }
+}
+
+pub fn prelude<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+where
+    T: Send + Sync + Clone + 'static,
+    R: Send + Sync + 'static,
+{
+    if data.len() == 0 {
+        // Nothing to process
+        vec![]
+    } else if data.len() < THRESHOLD {
+        // Process sequentially if below the threshold
+        data.iter().map(|item| f(item.clone())).collect()
+    } else {
+        data.par_iter().map(|item| f(item.clone())).collect()
+    }
+}
+
+pub fn flexible_parallel<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
     T: Send + Clone + 'static,
     R: Send + 'static,
@@ -165,7 +274,25 @@ mod tests {
         let elapsed = now.elapsed();
         println!("Straightforward elapsed: {:.2?}", elapsed);
 
+        let now = Instant::now();
+        let results_arc = straightforward_parallel_arc(&data, |x| x / 2);
+        let elapsed = now.elapsed();
+        println!("Straightforward arc elapsed: {:.2?}", elapsed);
+
+        let now = Instant::now();
+        let results_arc_nomutex = straightforward_parallel_arc_nomutex(&data, |x| x / 2);
+        let elapsed = now.elapsed();
+        println!("Straightforward arc nomutex elapsed: {:.2?}", elapsed);
+
+        let now = Instant::now();
+        let results_prelude = prelude(&data, |x| x / 2);
+        let elapsed = now.elapsed();
+        println!("Prelude elapsed: {:.2?}", elapsed);
+
         assert_eq!(results, exp_result);
+        assert_eq!(results_arc, exp_result);
+        assert_eq!(results_arc_nomutex, exp_result);
+        assert_eq!(results_prelude, exp_result);
     }
 
     #[test]
@@ -212,7 +339,7 @@ mod tests {
         let now = Instant::now();
         let mut results = flexible_parallel(&data, |x| x / 2);
         let elapsed = now.elapsed();
-        println!("Straightforward elapsed: {:.2?}", elapsed);
+        println!("Flexible elapsed: {:.2?}", elapsed);
 
         results.sort();
         exp_result.sort();

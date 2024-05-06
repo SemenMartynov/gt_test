@@ -45,9 +45,9 @@ use threadpool::ThreadPool;
 // Adjust the threshold
 const THRESHOLD: usize = 128;
 
-pub fn straightforward_parallel<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
-    T: Send + Copy + 'static,
+    T: Send + Clone + 'static,
     R: Send + 'static,
 {
     if data.len() == 0 {
@@ -55,7 +55,7 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|&item| f(item)).collect()
+        data.iter().map(f).collect()
     } else {
         // Split the work into threads
         let num_workers = available_parallelism().unwrap().get();
@@ -67,7 +67,7 @@ where
         for chunk in data.chunks(chunk_size) {
             let chunk_data = chunk.to_vec();
             let handle = thread::spawn(move || {
-                chunk_data.iter().map(|&item| f(item)).collect::<Vec<_>>()
+                chunk_data.iter().map(f).collect::<Vec<_>>()
             });
             handles.push(handle);
         }
@@ -81,9 +81,9 @@ where
     }
 }
 
-pub fn straightforward_parallel_arc<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel_arc<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
-    T: Send + Sync  + Copy + 'static,
+    T: Send + Sync + 'static,
     R: Send + Clone + Default + Debug + 'static,
 {
     if data.len() == 0 {
@@ -91,7 +91,7 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|&item| f(item)).collect()
+        data.iter().map(f).collect()
     } else {
         let input = Arc::new(data);
         let output = Arc::new(Mutex::new(vec![R::default(); input.len()]));
@@ -110,7 +110,7 @@ where
                 let end = std::cmp::min(start + chunk_size, input.len());
 
                 for j in start..end {
-                    let result = f(input[j]);
+                    let result = f(&input[j]);
                     output.lock().unwrap()[j] = result;
                 }
             });
@@ -126,9 +126,9 @@ where
     }
 }
 
-pub fn straightforward_parallel_arc_nomutex<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel_arc_nomutex<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
-    T: Send + Sync  + Copy + 'static,
+    T: Send + Sync + 'static,
     R: Send + Clone + Default + Debug + 'static,
 {
     if data.len() == 0 {
@@ -136,7 +136,7 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|&item| f(item)).collect()
+        data.iter().map(f).collect()
     } else {
         let input = Arc::new(data);
 
@@ -154,7 +154,7 @@ where
                 let end = std::cmp::min(start + chunk_size, input.len());
 
                 let chunk = &input[start..end];
-                chunk.iter().map(|&item| f(item)).collect::<Vec<_>>()
+                chunk.iter().map(f).collect::<Vec<_>>()
 
                 //let chunk_data = chunk.to_vec();
                 //chunk_data.into_iter().map(f).collect::<Vec<_>>()
@@ -171,9 +171,9 @@ where
     }
 }
 
-pub fn prelude<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn prelude<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
-    T: Send + Sync  + Copy + 'static,
+    T: Send + Sync + 'static,
     R: Send + Sync + 'static,
 {
     if data.len() == 0 {
@@ -181,15 +181,15 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|&item| f(item)).collect()
+        data.iter().map(f).collect()
     } else {
-        data.par_iter().map(|&item| f(item)).collect()
+        data.par_iter().map(f).collect()
     }
 }
 
-pub fn flexible_parallel<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn flexible_parallel<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
-    T: Send + Copy + 'static,
+    T: Send + Clone + 'static,
     R: Send + 'static,
 {
     if data.len() == 0 {
@@ -197,7 +197,7 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|&item| f(item)).collect()
+        data.iter().map(f).collect()
     } else {
         let num_workers = available_parallelism().unwrap().get();
         let pool = ThreadPool::new(num_workers);
@@ -207,7 +207,7 @@ where
             let tx = tx.clone();
             let val = item.clone();
             pool.execute(move || {
-                let result = f(val);
+                let result = f(&val);
                 tx.send(result).expect("Channel will be open.");
             });
         }
@@ -242,7 +242,7 @@ mod tests {
     fn straightforward_panic_test() {
         let data = vec![1, 2, 3, 4, 5];
         let results = straightforward_parallel(data, |x| {
-            if x == 3 {
+            if *x == 3 {
                 panic!("Panic! Value 3!");
             }
             x * 2
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn straightforward_type_test() {
         let data = vec![1, 2, 3, 4, 5];
-        let function = |x: i32| x as f64;
+        let function = |x: &i32| *x as f64;
         let results = straightforward_parallel(data, function);
         assert_eq!(results, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
     }
@@ -294,7 +294,7 @@ mod tests {
         let now = Instant::now();
         let results_prelude = prelude(data_clone, |x| x / 2);
         let elapsed = now.elapsed();
-        println!("Rayon Prelude elapsed: {:.2?}", elapsed);
+        println!("Prelude elapsed: {:.2?}", elapsed);
 
         assert_eq!(results, exp_result);
         assert_eq!(results_arc, exp_result);
@@ -324,7 +324,7 @@ mod tests {
     fn flexible_type_test() {
         let data = vec![1, 2, 3, 4, 5];
         let exp_result = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let function = |x: i32| x as f64;
+        let function = |x: &i32| *x as f64;
         let mut results = flexible_parallel(data, function);
         results.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(results, exp_result);

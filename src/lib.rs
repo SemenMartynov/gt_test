@@ -29,7 +29,7 @@ use threadpool::ThreadPool;
 /// use gt_test::straightforward_parallel;
 ///
 /// let data = vec![1, 2, 3, 4, 5];
-/// let results = straightforward_parallel(&data, |x| x * 2);
+/// let results = straightforward_parallel(data, |x| x * 2);
 /// assert_eq!(results, vec![2, 4, 6, 8, 10]);
 /// ```
 /// # Example
@@ -38,16 +38,16 @@ use threadpool::ThreadPool;
 /// use gt_test::flexible_parallel;
 ///
 /// let data = vec![1, 2, 3, 4, 5];
-/// let results = flexible_parallel(&data, |x| x * 2);
+/// let results = flexible_parallel(data, |x| x * 2);
 /// assert_eq!(results, vec![2, 4, 6, 8, 10]);
 /// ```
 
 // Adjust the threshold
 const THRESHOLD: usize = 128;
 
-pub fn straightforward_parallel<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
-    T: Send + Clone + 'static,
+    T: Send + Copy + 'static,
     R: Send + 'static,
 {
     if data.len() == 0 {
@@ -55,7 +55,7 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|item| f(item.clone())).collect()
+        data.iter().map(|&item| f(item)).collect()
     } else {
         // Split the work into threads
         let num_workers = available_parallelism().unwrap().get();
@@ -66,7 +66,9 @@ where
 
         for chunk in data.chunks(chunk_size) {
             let chunk_data = chunk.to_vec();
-            let handle = thread::spawn(move || chunk_data.into_iter().map(f).collect::<Vec<_>>());
+            let handle = thread::spawn(move || {
+                chunk_data.iter().map(|&item| f(item)).collect::<Vec<_>>()
+            });
             handles.push(handle);
         }
 
@@ -79,9 +81,9 @@ where
     }
 }
 
-pub fn straightforward_parallel_arc<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel_arc<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
-    T: Send + Clone + Sync + 'static,
+    T: Send + Sync  + Copy + 'static,
     R: Send + Clone + Default + Debug + 'static,
 {
     if data.len() == 0 {
@@ -89,14 +91,14 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|item| f(item.clone())).collect()
+        data.iter().map(|&item| f(item)).collect()
     } else {
-        let input = Arc::new(data.clone());
-        let output = Arc::new(Mutex::new(vec![R::default(); data.len()]));
+        let input = Arc::new(data);
+        let output = Arc::new(Mutex::new(vec![R::default(); input.len()]));
 
         // Split the work into threads
         let num_workers = available_parallelism().unwrap().get();
-        let chunk_size = (data.len() + num_workers - 1) / num_workers;
+        let chunk_size = (input.len() + num_workers - 1) / num_workers;
 
         let mut handles = Vec::with_capacity(num_workers);
 
@@ -108,7 +110,7 @@ where
                 let end = std::cmp::min(start + chunk_size, input.len());
 
                 for j in start..end {
-                    let result = f(input[j].clone());
+                    let result = f(input[j]);
                     output.lock().unwrap()[j] = result;
                 }
             });
@@ -124,9 +126,9 @@ where
     }
 }
 
-pub fn straightforward_parallel_arc_nomutex<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn straightforward_parallel_arc_nomutex<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
-    T: Send + Clone + Sync + 'static,
+    T: Send + Sync  + Copy + 'static,
     R: Send + Clone + Default + Debug + 'static,
 {
     if data.len() == 0 {
@@ -134,16 +136,16 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|item| f(item.clone())).collect()
+        data.iter().map(|&item| f(item)).collect()
     } else {
-        let input = Arc::new(data.clone());
+        let input = Arc::new(data);
 
         // Split the work into threads
         let num_workers = available_parallelism().unwrap().get();
-        let chunk_size = (data.len() + num_workers - 1) / num_workers;
+        let chunk_size = (input.len() + num_workers - 1) / num_workers;
 
         let mut handles = Vec::with_capacity(num_workers);
-        let mut results = Vec::with_capacity(data.len());
+        let mut results = Vec::with_capacity(input.len());
 
         for i in 0..num_workers {
             let input = Arc::clone(&input);
@@ -152,7 +154,7 @@ where
                 let end = std::cmp::min(start + chunk_size, input.len());
 
                 let chunk = &input[start..end];
-                chunk.iter().map(|item| f(item.clone())).collect::<Vec<_>>()
+                chunk.iter().map(|&item| f(item)).collect::<Vec<_>>()
 
                 //let chunk_data = chunk.to_vec();
                 //chunk_data.into_iter().map(f).collect::<Vec<_>>()
@@ -169,9 +171,9 @@ where
     }
 }
 
-pub fn prelude<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn prelude<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
-    T: Send + Sync + Clone + 'static,
+    T: Send + Sync  + Copy + 'static,
     R: Send + Sync + 'static,
 {
     if data.len() == 0 {
@@ -179,15 +181,15 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|item| f(item.clone())).collect()
+        data.iter().map(|&item| f(item)).collect()
     } else {
-        data.par_iter().map(|item| f(item.clone())).collect()
+        data.par_iter().map(|&item| f(item)).collect()
     }
 }
 
-pub fn flexible_parallel<T, R>(data: &Vec<T>, f: fn(t: T) -> R) -> Vec<R>
+pub fn flexible_parallel<T, R>(data: Vec<T>, f: fn(t: T) -> R) -> Vec<R>
 where
-    T: Send + Clone + 'static,
+    T: Send + Copy + 'static,
     R: Send + 'static,
 {
     if data.len() == 0 {
@@ -195,13 +197,13 @@ where
         vec![]
     } else if data.len() < THRESHOLD {
         // Process sequentially if below the threshold
-        data.iter().map(|item| f(item.clone())).collect()
+        data.iter().map(|&item| f(item)).collect()
     } else {
         let num_workers = available_parallelism().unwrap().get();
         let pool = ThreadPool::new(num_workers);
 
         let (tx, rx) = channel();
-        for item in data {
+        for item in data.iter() {
             let tx = tx.clone();
             let val = item.clone();
             pool.execute(move || {
@@ -224,14 +226,14 @@ mod tests {
     #[test]
     fn straightforward_positive_test() {
         let data = vec![1, 2, 3, 4, 5];
-        let results = straightforward_parallel(&data, |x| x * 2);
+        let results = straightforward_parallel(data, |x| x * 2);
         assert_eq!(results, vec![2, 4, 6, 8, 10]);
     }
 
     #[test]
     fn straightforward_negative_test() {
         let data = vec![1, 2, 3, 4, 5];
-        let results = straightforward_parallel(&data, |x| x * 2);
+        let results = straightforward_parallel(data, |x| x * 2);
         assert_ne!(results, vec![1, 2, 3, 4, 5]);
     }
 
@@ -239,7 +241,7 @@ mod tests {
     #[should_panic]
     fn straightforward_panic_test() {
         let data = vec![1, 2, 3, 4, 5];
-        let results = straightforward_parallel(&data, |x| {
+        let results = straightforward_parallel(data, |x| {
             if x == 3 {
                 panic!("Panic! Value 3!");
             }
@@ -251,7 +253,8 @@ mod tests {
     #[test]
     fn straightforward_type_test() {
         let data = vec![1, 2, 3, 4, 5];
-        let results = straightforward_parallel(&data, f64::from);
+        let function = |x: i32| x as f64;
+        let results = straightforward_parallel(data, function);
         assert_eq!(results, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 
@@ -268,26 +271,30 @@ mod tests {
             exp_result.push(val / 2);
         }
 
+        let data_clone = data.clone();
         use std::time::Instant;
         let now = Instant::now();
-        let results = straightforward_parallel(&data, |x| x / 2);
+        let results = straightforward_parallel(data_clone, |x| x / 2);
         let elapsed = now.elapsed();
         println!("Straightforward elapsed: {:.2?}", elapsed);
 
+        let data_clone = data.clone();
         let now = Instant::now();
-        let results_arc = straightforward_parallel_arc(&data, |x| x / 2);
+        let results_arc = straightforward_parallel_arc(data_clone, |x| x / 2);
         let elapsed = now.elapsed();
         println!("Straightforward arc elapsed: {:.2?}", elapsed);
 
+        let data_clone = data.clone();
         let now = Instant::now();
-        let results_arc_nomutex = straightforward_parallel_arc_nomutex(&data, |x| x / 2);
+        let results_arc_nomutex = straightforward_parallel_arc_nomutex(data_clone, |x| x / 2);
         let elapsed = now.elapsed();
         println!("Straightforward arc nomutex elapsed: {:.2?}", elapsed);
 
+        let data_clone = data.clone();
         let now = Instant::now();
-        let results_prelude = prelude(&data, |x| x / 2);
+        let results_prelude = prelude(data_clone, |x| x / 2);
         let elapsed = now.elapsed();
-        println!("Prelude elapsed: {:.2?}", elapsed);
+        println!("Rayon Prelude elapsed: {:.2?}", elapsed);
 
         assert_eq!(results, exp_result);
         assert_eq!(results_arc, exp_result);
@@ -299,7 +306,7 @@ mod tests {
     fn flexible_positive_test() {
         let data = vec![1, 2, 3, 4, 5];
         let exp_result = vec![2, 4, 6, 8, 10];
-        let mut results = flexible_parallel(&data, |x| x * 2);
+        let mut results = flexible_parallel(data, |x| x * 2);
         results.sort();
         assert_eq!(results, exp_result);
     }
@@ -308,7 +315,7 @@ mod tests {
     fn flexible_negative_test() {
         let data = vec![1, 2, 3, 4, 5];
         let exp_result = vec![1, 2, 3, 4, 5];
-        let mut results = flexible_parallel(&data, |x| x * 2);
+        let mut results = flexible_parallel(data, |x| x * 2);
         results.sort();
         assert_ne!(results, exp_result);
     }
@@ -317,7 +324,8 @@ mod tests {
     fn flexible_type_test() {
         let data = vec![1, 2, 3, 4, 5];
         let exp_result = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let mut results = flexible_parallel(&data, f64::from);
+        let function = |x: i32| x as f64;
+        let mut results = flexible_parallel(data, function);
         results.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(results, exp_result);
     }
@@ -337,7 +345,7 @@ mod tests {
 
         use std::time::Instant;
         let now = Instant::now();
-        let mut results = flexible_parallel(&data, |x| x / 2);
+        let mut results = flexible_parallel(data, |x| x / 2);
         let elapsed = now.elapsed();
         println!("Flexible elapsed: {:.2?}", elapsed);
 

@@ -81,6 +81,49 @@ where
     }
 }
 
+pub fn parallel_split_off<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    if data.len() == 0 {
+        // Nothing to process
+        vec![]
+    } else if data.len() < THRESHOLD {
+        // Process sequentially if below the threshold
+        data.iter().map(f).collect()
+    } else {
+        // Split the work into threads
+        let num_workers = available_parallelism().unwrap().get();
+        let chunk_size = 1 + data.len() / num_workers;
+
+        let mut handles = Vec::with_capacity(num_workers);
+        let mut results = Vec::with_capacity(data.len());
+
+        let mut data = data;
+        for _ in 0..num_workers {
+            // I do expect that `copy` works as `move` here
+            let chunk_data = data.split_off(data.len() - data.len().min(chunk_size));
+            // If there's no data left to process, we're done
+            if chunk_data.is_empty() {
+                break;
+            }
+
+            let handle = thread::spawn(move || {
+                chunk_data.iter().map(f).collect::<Vec<_>>()
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from threads
+        for handle in handles {
+            results.extend(handle.join().unwrap());
+        }
+
+        results
+    }
+}
+
 pub fn straightforward_parallel_arc<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
     T: Send + Sync + 'static,
@@ -98,7 +141,7 @@ where
 
         // Split the work into threads
         let num_workers = available_parallelism().unwrap().get();
-        let chunk_size = (input.len() + num_workers - 1) / num_workers;
+        let chunk_size = 1 + input.len() / num_workers;
 
         let mut handles = Vec::with_capacity(num_workers);
 
@@ -142,7 +185,7 @@ where
 
         // Split the work into threads
         let num_workers = available_parallelism().unwrap().get();
-        let chunk_size = (input.len() + num_workers - 1) / num_workers;
+        let chunk_size = 1 + input.len() / num_workers;
 
         let mut handles = Vec::with_capacity(num_workers);
         let mut results = Vec::with_capacity(input.len());
@@ -220,7 +263,7 @@ where
 #[cfg(test)]
 mod tests {
     use rand::Rng;
-
+    use std::time::Instant;
     use super::*;
 
     #[test]
@@ -260,39 +303,55 @@ mod tests {
 
     #[test]
     fn straightforward_huge_test() {
-        let limit = THRESHOLD * 100_000;
+        let limit = 1_000;
+        let inner_limit = 1_000_000;
         let mut data = Vec::with_capacity(limit);
         let mut exp_result = Vec::with_capacity(limit);
         let mut rng = rand::thread_rng();
 
-        for _ in 0..limit {
-            let val = rng.gen::<i32>();
-            data.push(val);
-            exp_result.push(val / 2);
+        fn divide_vec_by_two(vec: &Vec<i32>) -> Vec<i32> {
+            vec.iter().map(|&element| element / 2).collect()
         }
+        let f: fn(&Vec<i32>) -> Vec<i32> = divide_vec_by_two;
+
+        for i in 0..limit {
+            let mut inner_data = Vec::with_capacity(inner_limit);
+            let mut inner_exp_result = Vec::with_capacity(inner_limit);
+            for _ in 0..inner_limit {
+                let val = rng.gen::<i32>();
+                inner_data.push(val);
+                inner_exp_result.push(val / 2);
+            }
+            data.push(inner_data);
+            exp_result.push(inner_exp_result);
+
+            if i % 1000 == 0 {
+                println!("Generating dataset...");
+            }
+        }
+        println!("The dataset is generated!");
 
         let data_clone = data.clone();
-        use std::time::Instant;
         let now = Instant::now();
-        let results = straightforward_parallel(data_clone, |x| x / 2);
+        let results = straightforward_parallel(data_clone, f);
         let elapsed = now.elapsed();
         println!("Straightforward elapsed: {:.2?}", elapsed);
 
         let data_clone = data.clone();
         let now = Instant::now();
-        let results_arc = straightforward_parallel_arc(data_clone, |x| x / 2);
+        let results_arc = straightforward_parallel_arc(data_clone, f);
         let elapsed = now.elapsed();
         println!("Straightforward arc elapsed: {:.2?}", elapsed);
 
         let data_clone = data.clone();
         let now = Instant::now();
-        let results_arc_nomutex = straightforward_parallel_arc_nomutex(data_clone, |x| x / 2);
+        let results_arc_nomutex = straightforward_parallel_arc_nomutex(data_clone, f);
         let elapsed = now.elapsed();
         println!("Straightforward arc nomutex elapsed: {:.2?}", elapsed);
 
         let data_clone = data.clone();
         let now = Instant::now();
-        let results_prelude = prelude(data_clone, |x| x / 2);
+        let results_prelude = prelude(data_clone, f);
         let elapsed = now.elapsed();
         println!("Prelude elapsed: {:.2?}", elapsed);
 
@@ -332,26 +391,51 @@ mod tests {
 
     #[test]
     fn flexible_huge_test() {
-        let limit = THRESHOLD * 100_000;
+        let limit = 1_000;
+        let inner_limit = 1_000_000;
         let mut data = Vec::with_capacity(limit);
         let mut exp_result = Vec::with_capacity(limit);
         let mut rng = rand::thread_rng();
 
-        for _ in 0..limit {
-            let val = rng.gen::<i32>();
-            data.push(val);
-            exp_result.push(val / 2);
+        fn divide_vec_by_two(vec: &Vec<i32>) -> Vec<i32> {
+            vec.iter().map(|&element| element / 2).collect()
         }
+        let f: fn(&Vec<i32>) -> Vec<i32> = divide_vec_by_two;
 
-        use std::time::Instant;
+        for i in 0..limit {
+            let mut inner_data = Vec::with_capacity(inner_limit);
+            let mut inner_exp_result = Vec::with_capacity(inner_limit);
+            for _ in 0..inner_limit {
+                let val = rng.gen::<i32>();
+                inner_data.push(val);
+                inner_exp_result.push(val / 2);
+            }
+            data.push(inner_data);
+            exp_result.push(inner_exp_result);
+
+            if i % 1000 == 0 {
+                println!("Generating dataset...");
+            }
+        }
+        println!("The dataset is generated!");
+
+        let data_clone = data.clone();
         let now = Instant::now();
-        let mut results = flexible_parallel(data, |x| x / 2);
+        let mut results = flexible_parallel(data_clone, f);
         let elapsed = now.elapsed();
         println!("Flexible elapsed: {:.2?}", elapsed);
 
+        let data_clone = data.clone();
+        let now = Instant::now();
+        let mut results_split_off = parallel_split_off(data_clone, f);
+        let elapsed = now.elapsed();
+        println!("Flexible split off elapsed: {:.2?}", elapsed);
+
         results.sort();
         exp_result.sort();
+        results_split_off.sort();
 
         assert_eq!(results, exp_result);
+        assert_eq!(results_split_off, exp_result);
     }
 }

@@ -66,9 +66,7 @@ where
 
         for chunk in data.chunks(chunk_size) {
             let chunk_data = chunk.to_vec();
-            let handle = thread::spawn(move || {
-                chunk_data.iter().map(f).collect::<Vec<_>>()
-            });
+            let handle = thread::spawn(move || chunk_data.iter().map(f).collect::<Vec<_>>());
             handles.push(handle);
         }
 
@@ -109,9 +107,7 @@ where
                 break;
             }
 
-            let handle = thread::spawn(move || {
-                chunk_data.iter().map(f).collect::<Vec<_>>()
-            });
+            let handle = thread::spawn(move || chunk_data.iter().map(f).collect::<Vec<_>>());
             handles.push(handle);
         }
 
@@ -169,6 +165,122 @@ where
     }
 }
 
+pub fn straightforward_parallel_arc2<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
+where
+    T: Send + Sync + 'static,
+    R: Send + Clone + Default + Debug + 'static,
+{
+    if data.len() == 0 {
+        // Nothing to process
+        vec![]
+    } else if data.len() < THRESHOLD {
+        // Process sequentially if below the threshold
+        data.iter().map(f).collect()
+    } else {
+        let input = Arc::new(data);
+        let output = Arc::new(Mutex::new(vec![R::default(); input.len()]));
+
+        // Split the work into threads
+        let num_workers = available_parallelism().unwrap().get();
+        let chunk_size = 1 + input.len() / num_workers;
+
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for i in 0..num_workers {
+            let input = Arc::clone(&input);
+            let output = Arc::clone(&output);
+            let handle = thread::spawn(move || {
+                let start = i * chunk_size;
+                let end = std::cmp::min(start + chunk_size, input.len());
+
+                let mut buff = Vec::with_capacity(end - start);
+                for j in start..end {
+                    buff.push(f(&input[j]));
+                }
+
+                output.lock().unwrap().splice(start..end, buff);
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        Arc::try_unwrap(output).unwrap().into_inner().unwrap()
+    }
+}
+
+pub fn straightforward_parallel_arc3<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
+where
+    T: Send + Sync + 'static,
+    R: Send + Debug + 'static,
+{
+    if data.len() == 0 {
+        // Nothing to process
+        vec![]
+    } else if data.len() < THRESHOLD {
+        // Process sequentially if below the threshold
+        data.iter().map(f).collect()
+    } else {
+        let input = Arc::new(data);
+        use std::mem::MaybeUninit;
+        let output = Arc::new(Mutex::new({
+            let mut vec: Vec<MaybeUninit<R>> = Vec::with_capacity(input.len());
+            unsafe {
+                vec.set_len(input.len());
+            }
+            vec
+        }));
+
+        // Split the work into threads
+        let num_workers = available_parallelism().unwrap().get();
+        let chunk_size = 1 + input.len() / num_workers;
+
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for i in 0..num_workers {
+            let input = Arc::clone(&input);
+            let output = Arc::clone(&output);
+            let handle = thread::spawn(move || {
+                let start = i * chunk_size;
+                let end = std::cmp::min(start + chunk_size, input.len());
+
+                // calculate results
+                use std::collections::VecDeque;
+                let mut buff = VecDeque::with_capacity(end - start);
+                for j in start..end {
+                    buff.push_front(f(&input[j]));
+                }
+
+                // move data
+                for j in start..end {
+                    let ptr = output.lock().unwrap()[j].as_mut_ptr();
+                    unsafe {
+                        // there must be a more efficient way!
+                        ptr.write(buff.pop_back().unwrap());
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Collect results from threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        //transform vector from MaybeUninit into R
+        let initialized_vec = unsafe {
+            std::mem::transmute::<Vec<MaybeUninit<R>>, Vec<R>>(
+                Arc::try_unwrap(output).unwrap().into_inner().unwrap(),
+            )
+        };
+        initialized_vec
+    }
+}
+
 pub fn straightforward_parallel_arc_nomutex<T, R>(data: Vec<T>, f: fn(t: &T) -> R) -> Vec<R>
 where
     T: Send + Sync + 'static,
@@ -207,7 +319,7 @@ where
 
         // Collect results from threads
         for handle in handles {
-            results.extend(handle.join().unwrap());
+            results.extend(handle.join().unwrap()); // =(
         }
 
         results
@@ -262,9 +374,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
-    use std::time::Instant;
     use super::*;
+    use rand::Rng;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn straightforward_positive_test() {
@@ -303,8 +415,10 @@ mod tests {
 
     #[test]
     fn straightforward_huge_test() {
+        let probes = 10;
+
         let limit = 1_000;
-        let inner_limit = 1_000_000;
+        let inner_limit = 1_000_000; // 3.8MB
         let mut data = Vec::with_capacity(limit);
         let mut exp_result = Vec::with_capacity(limit);
         let mut rng = rand::thread_rng();
@@ -331,34 +445,104 @@ mod tests {
         }
         println!("The dataset is generated!");
 
-        let data_clone = data.clone();
-        let now = Instant::now();
-        let results = straightforward_parallel(data_clone, f);
-        let elapsed = now.elapsed();
-        println!("Straightforward elapsed: {:.2?}", elapsed);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let results = straightforward_parallel(data_clone, f);
+            let elapsed = now.elapsed();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("straightforward_parallel test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
 
-        let data_clone = data.clone();
-        let now = Instant::now();
-        let results_arc = straightforward_parallel_arc(data_clone, f);
-        let elapsed = now.elapsed();
-        println!("Straightforward arc elapsed: {:.2?}", elapsed);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let results = straightforward_parallel_arc(data_clone, f);
+            let elapsed = now.elapsed();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("straightforward_parallel_arc test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
 
-        let data_clone = data.clone();
-        let now = Instant::now();
-        let results_arc_nomutex = straightforward_parallel_arc_nomutex(data_clone, f);
-        let elapsed = now.elapsed();
-        println!("Straightforward arc nomutex elapsed: {:.2?}", elapsed);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let results = straightforward_parallel_arc2(data_clone, f);
+            let elapsed = now.elapsed();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("straightforward_parallel_arc2 test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
 
-        let data_clone = data.clone();
-        let now = Instant::now();
-        let results_prelude = prelude(data_clone, f);
-        let elapsed = now.elapsed();
-        println!("Prelude elapsed: {:.2?}", elapsed);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let results = straightforward_parallel_arc3(data_clone, f);
+            let elapsed = now.elapsed();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("straightforward_parallel_arc3 test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
 
-        assert_eq!(results, exp_result);
-        assert_eq!(results_arc, exp_result);
-        assert_eq!(results_arc_nomutex, exp_result);
-        assert_eq!(results_prelude, exp_result);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let results = straightforward_parallel_arc_nomutex(data_clone, f);
+            let elapsed = now.elapsed();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!(
+            "straightforward_parallel_arc_nomutex test ({} iterations)",
+            probes
+        );
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
+
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let results = prelude(data_clone, f);
+            let elapsed = now.elapsed();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("prelude test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
     }
 
     #[test]
@@ -391,6 +575,8 @@ mod tests {
 
     #[test]
     fn flexible_huge_test() {
+        let probes = 10;
+
         let limit = 1_000;
         let inner_limit = 1_000_000;
         let mut data = Vec::with_capacity(limit);
@@ -417,25 +603,80 @@ mod tests {
                 println!("Generating dataset...");
             }
         }
+        exp_result.sort();
         println!("The dataset is generated!");
 
-        let data_clone = data.clone();
-        let now = Instant::now();
-        let mut results = flexible_parallel(data_clone, f);
-        let elapsed = now.elapsed();
-        println!("Flexible elapsed: {:.2?}", elapsed);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let mut results = flexible_parallel(data_clone, f);
+            let elapsed = now.elapsed();
+            results.sort();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("flexible_parallel test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
 
-        let data_clone = data.clone();
-        let now = Instant::now();
-        let mut results_split_off = parallel_split_off(data_clone, f);
-        let elapsed = now.elapsed();
-        println!("Flexible split off elapsed: {:.2?}", elapsed);
+        let mut durations = Vec::with_capacity(probes);
+        for _ in 0..probes {
+            let data_clone = data.clone();
+            let now = Instant::now();
+            let mut results = parallel_split_off(data_clone, f);
+            let elapsed = now.elapsed();
+            results.sort();
+            durations.push(elapsed);
+            assert_eq!(results, exp_result);
+        }
+        let (average, max, min, variance) = get_stats(durations);
+        println!("parallel_split_off test ({} iterations)", probes);
+        println!(
+            "AVG: {:.2?}, MAX: {:.2?}, MIN: {:.2?}, AVG: {:.5?}",
+            average, max, min, variance
+        );
+    }
 
-        results.sort();
-        exp_result.sort();
-        results_split_off.sort();
+    fn get_stats(durations: Vec<Duration>) -> (Duration, Duration, Duration, Duration) {
+        let count = durations.len();
+        if count == 0 {
+            panic!("The vector is empty");
+        }
 
-        assert_eq!(results, exp_result);
-        assert_eq!(results_split_off, exp_result);
+        // Convert durations to f64 for easier calculations
+        let durations_sec: Vec<f64> = durations.iter().map(|d| d.as_secs_f64()).collect();
+
+        // Get average
+        let sum: f64 = durations_sec.iter().sum();
+        let average = sum / count as f64;
+
+        // Get max and min
+        let max = durations_sec
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min = durations_sec.iter().cloned().fold(f64::INFINITY, f64::min);
+
+        // Get variance
+        let variance = durations_sec
+            .iter()
+            .map(|&value| {
+                let diff = value - average;
+                diff * diff
+            })
+            .sum::<f64>()
+            / count as f64;
+
+        // Convert back to Duration
+        let average_duration = Duration::from_secs_f64(average);
+        let max_duration = Duration::from_secs_f64(max);
+        let min_duration = Duration::from_secs_f64(min);
+        let variance = Duration::from_secs_f64(variance);
+
+        (average_duration, max_duration, min_duration, variance)
     }
 }
